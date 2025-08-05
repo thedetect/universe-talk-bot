@@ -3,3 +3,4 @@ credentials.json
 render.yaml
 .env
 
+.DS_Store
