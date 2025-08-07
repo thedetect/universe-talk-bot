@@ -369,10 +369,32 @@ def count_referrals(telegram_id: int) -> int:
 
 
 def list_referrals(telegram_id: int) -> List[sqlite3.Row]:
-    """Return a list of rows representing users referred by a user."""
+    """Return a list of rows representing users referred by a user.
+
+    Parameters
+    ----------
+    telegram_id : int
+        The Telegram ID of the user whose referrals should be listed.
+
+    Returns
+    -------
+    list of sqlite3.Row
+        A list of user records for all users who were referred by this user's
+        referral code.  If the user has no referral code or no referrals, an
+        empty list is returned.
+    """
     user = get_user(telegram_id)
     if not user or not user["referral_code"]:
         return []
+    code = user["referral_code"]
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM users WHERE referred_by = ?",
+                (code,),
+            )
+            return cursor.fetchall()
 
 
 def set_trial_expiration(telegram_id: int, expiration_date: str) -> None:
@@ -423,12 +445,3 @@ def clear_trial(telegram_id: int) -> None:
                 (telegram_id,),
             )
             conn.commit()
-    code = user["referral_code"]
-    with _db_lock:
-        with _get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT * FROM users WHERE referred_by = ?",
-                (code,),
-            )
-            return cursor.fetchall()

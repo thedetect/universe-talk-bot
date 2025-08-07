@@ -60,11 +60,11 @@ import os
 # Telegram bot token provided by BotFather.  Replace the placeholder
 # below with your actual token before deploying the bot.  Never
 # commit real tokens to public repositories.
-BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "8044113090:AAHj1t4b-9Jd-fCksbTrfOnzorrZcORL-UA")
 
 # Payment provider token obtained from BotFather after configuring
 # your payment provider (e.g. Stripe).  Replace with your own token.
-PAYMENT_PROVIDER_TOKEN: str = os.environ.get("TELEGRAM_PAYMENT_PROVIDER_TOKEN", "YOUR_PROVIDER_TOKEN_HERE")
+PAYMENT_PROVIDER_TOKEN: str = os.environ.get("1744374395:TEST:bb3fb88b22f385da8b8e", "YOUR_PROVIDER_TOKEN_HERE")
 
 # Location of the SQLite database file.  By default this file will
 # reside in the same directory as this configuration module.

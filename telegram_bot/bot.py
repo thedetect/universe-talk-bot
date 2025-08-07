@@ -36,6 +36,8 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
+from telegram.error import TelegramError
+
 from . import astrology, config, database, payments, referral
 
 
@@ -410,7 +412,10 @@ def menu(update: Update, context: CallbackContext) -> int:
     # Send a minimal message with the keyboard attached.  We use a
     # single space as the text to avoid displaying an instruction like
     # "Выберите действие", per user request.
-    update.message.reply_text(" ", reply_markup=reply_markup)
+    # Use a zero‑width space to provide a non‑empty message while keeping
+    # the menu header invisible to the user.  Telegram requires the text
+    # argument to be non‑empty.
+    update.message.reply_text("\u200b", reply_markup=reply_markup)
     return MENU_ACTION
 
 
@@ -490,7 +495,15 @@ def subscribe(update: Update, context: CallbackContext) -> None:
             f"У вас уже есть активная подписка до {user['subscription_expiration']}."
         )
         return
-    payments.send_subscription_invoice(update, context)
+    try:
+        payments.send_subscription_invoice(update, context)
+    except TelegramError as err:
+        # Gracefully handle cases where the payment provider token is invalid or other errors occur
+        logger.warning(f"Failed to send subscription invoice: {err}")
+        update.message.reply_text(
+            "К сожалению, сейчас невозможно оформить подписку через Telegram Payments. "
+            "Попробуйте позже или свяжитесь с администратором."
+        )
 
 
 def show_status(update: Update, context: CallbackContext) -> None:
@@ -653,17 +666,18 @@ def handle_menu_reply(update: Update, context: CallbackContext) -> int:
     elif choice == "Рефералы":
         # Show referral status and then remove keyboard
         show_referrals(update, context)
-        update.message.reply_text(" ", reply_markup=ReplyKeyboardRemove())
+        # Remove the keyboard using a zero‑width space message
+        update.message.reply_text("\u200b", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
     elif choice == "Оформить подписку":
         # Initiate subscription purchase
         subscribe(update, context)
         # Remove keyboard after invoking subscribe
-        update.message.reply_text(" ", reply_markup=ReplyKeyboardRemove())
+        update.message.reply_text("\u200b", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
     elif choice == "Статус подписки":
         show_status(update, context)
-        update.message.reply_text(" ", reply_markup=ReplyKeyboardRemove())
+        update.message.reply_text("\u200b", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
     elif choice == "Обновить данные":
         # Start the personal data update conversation.  update_personal_data
@@ -685,7 +699,7 @@ def handle_menu_reply(update: Update, context: CallbackContext) -> int:
     else:
         # Unknown selection or user dismissed the keyboard
         update.message.reply_text(
-            " ",
+            "\u200b",
             reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
