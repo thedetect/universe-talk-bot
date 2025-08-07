@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Dict, Optional, Tuple
 
 from telegram import (
@@ -22,6 +22,7 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    KeyboardButton,
     Update,
 )
 from telegram.ext import (
@@ -55,7 +56,8 @@ logger = logging.getLogger(__name__)
     CHANGE_TIME,
     SELECT_FIELD,
     TYPING_VALUE,
-) = range(8)
+    MENU_ACTION,
+) = range(9)
 
 
 def parse_date(date_str: str) -> Optional[str]:
@@ -152,22 +154,85 @@ def send_daily_horoscope(context: CallbackContext) -> None:
     if not user:
         return
     chat_id = telegram_id
-    # If user has an active subscription, send the full message
-    if user["subscription_active"]:
-        message = astrology.get_daily_message(
-            user["birth_date"], user["birth_time"]
-        )
-        context.bot.send_message(chat_id=chat_id, text=message)
-    else:
-        # If not subscribed, send a limited preview and reminder
-        preview = astrology.get_daily_message(
-            user["birth_date"], user["birth_time"]
-        ).split("\n")[0]  # First line as preview
-        reminder = (
+    now = datetime.utcnow()
+    # Parse subscription and trial expiration dates if available
+    sub_expiration = None
+    if user.get("subscription_expiration"):
+        try:
+            sub_expiration = datetime.fromisoformat(user["subscription_expiration"])
+        except Exception:
+            sub_expiration = None
+    trial_expiration = None
+    if user.get("trial_expiration"):
+        try:
+            trial_expiration = datetime.fromisoformat(user["trial_expiration"])
+        except Exception:
+            trial_expiration = None
+    is_trial = bool(user.get("is_trial"))
+    subscription_active = bool(user.get("subscription_active"))
+    # Helper to send full horoscope message
+    def send_full_message():
+        msg = astrology.get_daily_message(user["birth_date"], user["birth_time"])
+        context.bot.send_message(chat_id=chat_id, text=msg)
+    def send_preview_and_offer():
+        preview = astrology.get_daily_message(user["birth_date"], user["birth_time"]).split("\n")[0]
+        # Offer to extend subscription or use bonus days
+        text = (
             f"{preview}\n\n"
-            "Для доступа к полному ежедневному сообщению оформите подписку с помощью команды /subscribe."
+            "Ваш пробный период завершён. Вы можете продлить подписку или воспользоваться бонусными днями, "
+            "накопленными за приглашения."
         )
-        context.bot.send_message(chat_id=chat_id, text=reminder)
+        # Present choices for subscription extension
+        keyboard = [
+            [InlineKeyboardButton("30 дней", callback_data="extend_30")],
+            [InlineKeyboardButton("60 дней", callback_data="extend_60")],
+            [InlineKeyboardButton("90 дней", callback_data="extend_90")],
+            [InlineKeyboardButton("120 дней", callback_data="extend_120")],
+            [InlineKeyboardButton("180 дней", callback_data="extend_180")],
+        ]
+        context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    # Case 1: Active paid subscription
+    if subscription_active and not is_trial:
+        if sub_expiration and sub_expiration >= now:
+            send_full_message()
+            return
+        else:
+            # Paid subscription expired
+            database.set_subscription_status(telegram_id, active=False)
+            subscription_active = False
+            sub_expiration = None
+    # Case 2: Active trial
+    if subscription_active and is_trial:
+        if sub_expiration and sub_expiration >= now:
+            send_full_message()
+            return
+        else:
+            # Trial expired; clear trial flags
+            database.clear_trial(telegram_id)
+            database.set_subscription_status(telegram_id, active=False)
+            subscription_active = False
+            is_trial = False
+    # Case 3: Use bonus days if available
+    bonus_days = user.get("points") or 0
+    if bonus_days > 0:
+        # Extend subscription with bonus days
+        new_expiration = now + timedelta(days=bonus_days)
+        # Reset points
+        database.update_points(telegram_id, -bonus_days)
+        database.set_subscription_status(
+            telegram_id,
+            active=True,
+            expiration_date=new_expiration.isoformat(),
+            is_trial=False,
+        )
+        send_full_message()
+        return
+    # Case 4: No active subscription or trial; send preview and offer subscription
+    send_preview_and_offer()
 
 
 def start(update: Update, context: CallbackContext) -> int:
@@ -275,6 +340,17 @@ def complete_registration(update: Update, context: CallbackContext) -> int:
     )
     # Assign a referral code if not already present
     code = referral.assign_referral_code(telegram_id)
+    # Compute a 10-day trial period starting now
+    now = datetime.utcnow()
+    trial_end = now + timedelta(days=10)
+    # Persist trial expiration and mark subscription as active (trial)
+    database.set_trial_expiration(telegram_id, trial_end.isoformat())
+    database.set_subscription_status(
+        telegram_id,
+        active=True,
+        expiration_date=trial_end.isoformat(),
+        is_trial=True,
+    )
     # Schedule the daily job
     schedule_daily_job(context, telegram_id, notify_time)
     # Greet the user and present the menu
@@ -297,33 +373,45 @@ def cancel(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 
-def menu(update: Update, context: CallbackContext) -> None:
-    """Display available commands and features to the user."""
+def menu(update: Update, context: CallbackContext) -> int:
+    """Show the main menu using a reply keyboard.
+
+    When the user invokes /menu, present a set of buttons at the bottom of
+    the chat.  These buttons correspond to common actions such as
+    changing the notification time, viewing referrals, managing the
+    subscription and updating personal data.  When a button is pressed
+    the text of that button will be sent to the bot and handled by
+    `handle_menu_reply`.  We return the `MENU_ACTION` state so that
+    further messages can be captured by the conversation handler.
+    """
     telegram_id = update.effective_user.id
     user = database.get_user(telegram_id)
     if not user:
         update.message.reply_text(
             "Сначала зарегистрируйтесь с помощью команды /start."
         )
-        return
-    # Present the user with an inline keyboard of available actions.  Each
-    # button sends a callback query that we handle in `handle_menu_callback`.
+        return ConversationHandler.END
+    # Build a reply keyboard with menu options.  Each button sends its
+    # label as text when pressed.  Use one_time_keyboard so the
+    # keyboard hides after a selection.
     keyboard = [
-        [InlineKeyboardButton("Изменить время", callback_data="menu_settime")],
-        [InlineKeyboardButton("Рефералы", callback_data="menu_referrals")],
-        [InlineKeyboardButton("Оформить подписку", callback_data="menu_subscribe")],
-        [InlineKeyboardButton("Статус подписки", callback_data="menu_status")],
-        [InlineKeyboardButton("Обновить данные", callback_data="menu_update")],
+        [KeyboardButton("Изменить время"), KeyboardButton("Рефералы")],
+        [KeyboardButton("Оформить подписку"), KeyboardButton("Статус подписки")],
+        [KeyboardButton("Обновить данные")],
     ]
-    # If the user is an admin, include a broadcast option
+    # If the user is an admin, provide a broadcast option
     if telegram_id in config.ADMIN_IDS:
-        keyboard.append([InlineKeyboardButton("Рассылка", callback_data="menu_broadcast")])
-    # Always include a cancel/close option so the user can dismiss the menu
-    keyboard.append([InlineKeyboardButton("Закрыть меню", callback_data="menu_close")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text(
-        "Выберите действие:", reply_markup=reply_markup
+        keyboard.append([KeyboardButton("Рассылка")])
+    reply_markup = ReplyKeyboardMarkup(
+        keyboard,
+        one_time_keyboard=True,
+        resize_keyboard=True,
     )
+    # Send a minimal message with the keyboard attached.  We use a
+    # single space as the text to avoid displaying an instruction like
+    # "Выберите действие", per user request.
+    update.message.reply_text(" ", reply_markup=reply_markup)
+    return MENU_ACTION
 
 
 def set_time_command(update: Update, context: CallbackContext) -> None:
@@ -335,12 +423,11 @@ def set_time_command(update: Update, context: CallbackContext) -> None:
             "Сначала зарегистрируйтесь с помощью /start."
         )
         return
+    # Ask the user to provide a new time.  We return the CHANGE_TIME state
+    # so that the next message from the user is captured by the
+    # corresponding handler.
     update.message.reply_text(
-        "Введите новое время для получения сообщений (HH:MM)."
-    )
-    # Use conversation handler state to capture the next message
-    update.message.reply_text(
-        "Введите новое время в формате HH:MM, например, 21:30."
+        "Введите новое время в формате HH:MM (24‑часовой), например, 21:30."
     )
     return CHANGE_TIME
 
@@ -383,7 +470,7 @@ def show_referrals(update: Update, context: CallbackContext) -> None:
     update.message.reply_text(
         f"Твоя реферальная ссылка: {link}\n"
         f"Кол-во приглашённых: {count}\n"
-        f"Баллы: {points}\n"
+        f"Бонусные дни: {points}\n"
         f"Приглашённые: {ref_list}"
     )
 
@@ -432,52 +519,58 @@ def update_personal_data(update: Update, context: CallbackContext) -> int:
             "Сначала зарегистрируйтесь через /start."
         )
         return
-    # Ask which field to update
-    # Include an extra button that allows the user to cancel out of the update
-    # process and return to the main menu without making changes.  We use
-    # an inline keyboard so the user can simply tap to choose an action.
+    # Ask which field to update using a reply keyboard.  When the user selects
+    # an option, it will be sent as a regular text message.  The keyboard
+    # disappears after one use.
     keyboard = [
-        [InlineKeyboardButton("Имя", callback_data="update_name")],
-        [InlineKeyboardButton("Дата рождения", callback_data="update_birth_date")],
-        [InlineKeyboardButton("Место рождения", callback_data="update_birth_place")],
-        [InlineKeyboardButton("Время рождения", callback_data="update_birth_time")],
-        [InlineKeyboardButton("Оставить всё как есть", callback_data="update_cancel")],
+        [KeyboardButton("Имя"), KeyboardButton("Дата рождения")],
+        [KeyboardButton("Место рождения"), KeyboardButton("Время рождения")],
+        [KeyboardButton("Оставить всё как есть")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     update.message.reply_text(
-        "Что вы хотите изменить?", reply_markup=reply_markup
+        "Что вы хотите изменить?",
+        reply_markup=reply_markup,
     )
     return SELECT_FIELD
 
 
-def handle_update_callback(update: Update, context: CallbackContext) -> int:
-    """Handle the inline button selection during update."""
-    query = update.callback_query
-    query.answer()
-    data = query.data
-    if data == "update_cancel":
-        # User chose to leave everything unchanged.  Inform them and return to the
-        # main menu.  Ending the conversation here prevents further prompts.
-        query.message.reply_text(
-            "Изменения отменены. Используйте /menu для доступа к функциям."
-        )
+def handle_update_selection(update: Update, context: CallbackContext) -> int:
+    """Handle the user's selection of which personal field to update.
+
+    The user chooses an option from a reply keyboard.  Based on the text,
+    we set the `update_field` in `user_data` and prompt for the new value.
+    If the user chooses to leave everything unchanged, we exit the
+    conversation without further prompts.
+    """
+    choice = update.message.text.strip()
+    # Map the Russian labels to internal field names
+    mapping = {
+        "Имя": "name",
+        "Дата рождения": "birth_date",
+        "Место рождения": "birth_place",
+        "Время рождения": "birth_time",
+        "Оставить всё как есть": "cancel",
+    }
+    field = mapping.get(choice)
+    if field is None:
+        update.message.reply_text("Неизвестная опция. Попробуйте снова.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
-    if data == "update_name":
-        query.message.reply_text("Введите новое имя:")
-        context.user_data["update_field"] = "name"
-    elif data == "update_birth_date":
-        query.message.reply_text("Введите новую дату рождения (ДД.ММ.ГГГГ):")
-        context.user_data["update_field"] = "birth_date"
-    elif data == "update_birth_place":
-        query.message.reply_text("Введите новое место рождения:")
-        context.user_data["update_field"] = "birth_place"
-    elif data == "update_birth_time":
-        query.message.reply_text("Введите новое время рождения (HH:MM):")
-        context.user_data["update_field"] = "birth_time"
-    else:
-        query.message.reply_text("Неизвестная опция.")
-        return
-    # Move to the next conversation state
+    if field == "cancel":
+        # User chose to cancel updating any data; simply remove the keyboard
+        update.message.reply_text("Изменения отменены.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+    # Store which field we are updating
+    context.user_data["update_field"] = field
+    # Prompt the user for the new value
+    if field == "name":
+        update.message.reply_text("Введите новое имя:", reply_markup=ReplyKeyboardRemove())
+    elif field == "birth_date":
+        update.message.reply_text("Введите новую дату рождения (ДД.ММ.ГГГГ):", reply_markup=ReplyKeyboardRemove())
+    elif field == "birth_place":
+        update.message.reply_text("Введите новое место рождения:", reply_markup=ReplyKeyboardRemove())
+    elif field == "birth_time":
+        update.message.reply_text("Введите новое время рождения (HH:MM):", reply_markup=ReplyKeyboardRemove())
     return TYPING_VALUE
 
 
@@ -535,124 +628,107 @@ def broadcast(update: Update, context: CallbackContext) -> None:
     update.message.reply_text(f"Отправлено {count} сообщений.")
 
 
-def handle_menu_callback(update: Update, context: CallbackContext) -> int:
-    """Handle callback queries from the main menu inline keyboard.
+def handle_menu_reply(update: Update, context: CallbackContext) -> int:
+    """Handle user selections from the main menu reply keyboard.
 
-    Depending on which button the user pressed, this function either
-    sends a helpful prompt directing them to the appropriate command
-    or performs a small action such as showing their referral status or
-    subscription status.  The conversation is not advanced here;
-    commands that require additional input should still be invoked
-    manually by the user (e.g., /settime).
+    The user's choice is matched against the available menu options.  Depending
+    on the selection, the bot either instructs the user to run a
+    command (for actions that require multi‑step input), immediately
+    executes a helper such as showing referral status or subscription
+    status, or starts a secondary conversation (for updating data).
+
+    After handling, the reply keyboard is removed.  The function
+    returns `ConversationHandler.END` unless it forwards the user into
+    another conversation state (e.g., updating personal data).
+    """
+    telegram_id = update.effective_user.id
+    choice = update.message.text.strip()
+    # Route based on user choice
+    if choice == "Изменить время":
+        update.message.reply_text(
+            "Чтобы изменить время ежедневной рассылки, используйте команду /settime.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+    elif choice == "Рефералы":
+        # Show referral status and then remove keyboard
+        show_referrals(update, context)
+        update.message.reply_text(" ", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+    elif choice == "Оформить подписку":
+        # Initiate subscription purchase
+        subscribe(update, context)
+        # Remove keyboard after invoking subscribe
+        update.message.reply_text(" ", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+    elif choice == "Статус подписки":
+        show_status(update, context)
+        update.message.reply_text(" ", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+    elif choice == "Обновить данные":
+        # Start the personal data update conversation.  update_personal_data
+        # returns a state indicating the next step in that conversation.
+        return update_personal_data(update, context)
+    elif choice == "Рассылка":
+        # Broadcast is an admin‑only command
+        if telegram_id not in config.ADMIN_IDS:
+            update.message.reply_text(
+                "У вас нет прав для этой команды.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        else:
+            update.message.reply_text(
+                "Введите текст после команды /broadcast, чтобы отправить его всем пользователям.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        return ConversationHandler.END
+    else:
+        # Unknown selection or user dismissed the keyboard
+        update.message.reply_text(
+            " ",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+
+
+# The inline menu callback handler is no longer used now that the main menu
+# employs a reply keyboard.  Its logic has been replaced by
+# `handle_menu_reply`, which dispatches based on the selected text.
+
+
+def handle_extension_callback(update: Update, context: CallbackContext) -> None:
+    """Handle callback queries for subscription extension.
+
+    The callback data encodes the number of days to extend the subscription.
+    After extending, the message is edited to confirm the new expiration date.
     """
     query = update.callback_query
     query.answer()
     data = query.data
     telegram_id = query.from_user.id
-    # Route based on callback data
-    if data == "menu_settime":
-        # Inform the user how to change the time
+    # Extract number of days from callback_data, e.g., 'extend_30'
+    try:
+        days = int(data.split("_")[1])
+    except Exception:
         context.bot.send_message(
             chat_id=telegram_id,
-            text=(
-                "Чтобы изменить время ежедневной рассылки, отправьте команду /settime "
-                "и следуйте инструкции."
-            ),
+            text="Некорректный выбор срока. Попробуйте ещё раз."
         )
-    elif data == "menu_referrals":
-        # Show the referral status directly (reuse logic from show_referrals)
-        user = database.get_user(telegram_id)
-        if not user:
-            context.bot.send_message(
-                chat_id=telegram_id,
-                text="Сначала зарегистрируйтесь через /start."
-            )
-        else:
-            code = referral.assign_referral_code(telegram_id)
-            points, count, names = referral.get_referral_status(telegram_id)
-            link = f"t.me/{context.bot.username}?start={code}"
-            ref_list = ", ".join(names) if names else "пока нет приглашённых пользователей"
-            context.bot.send_message(
-                chat_id=telegram_id,
-                text=(
-                    f"Твоя реферальная ссылка: {link}\n"
-                    f"Кол-во приглашённых: {count}\n"
-                    f"Баллы: {points}\n"
-                    f"Приглашённые: {ref_list}"
-                ),
-            )
-    elif data == "menu_subscribe":
-        # Initiate subscription purchase.  If the user already has a subscription,
-        # the helper will inform them.
-        user = database.get_user(telegram_id)
-        if not user:
-            context.bot.send_message(
-                chat_id=telegram_id,
-                text="Сначала зарегистрируйтесь через /start."
-            )
-        elif user["subscription_active"]:
-            context.bot.send_message(
-                chat_id=telegram_id,
-                text=f"У вас уже есть активная подписка до {user['subscription_expiration']}."
-            )
-        else:
-            # Use the existing payment helper; it reads chat_id from the update.
-            payments.send_subscription_invoice(update, context)
-    elif data == "menu_status":
-        # Show subscription status
-        user = database.get_user(telegram_id)
-        if not user:
-            context.bot.send_message(
-                chat_id=telegram_id,
-                text="Сначала зарегистрируйтесь через /start."
-            )
-        elif user["subscription_active"]:
-            context.bot.send_message(
-                chat_id=telegram_id,
-                text=f"Ваша подписка активна до {user['subscription_expiration']}"
-            )
-        else:
-            context.bot.send_message(
-                chat_id=telegram_id,
-                text="У вас нет активной подписки. Используйте /subscribe, чтобы её оформить."
-            )
-    elif data == "menu_update":
-        # Prompt the user to invoke the update command
-        context.bot.send_message(
-            chat_id=telegram_id,
-            text=(
-                "Чтобы обновить персональные данные, используйте команду /update. "
-                "Там вы сможете выбрать, что изменить."
-            ),
-        )
-    elif data == "menu_broadcast":
-        # Admin broadcast command instructions
-        if telegram_id not in config.ADMIN_IDS:
-            context.bot.send_message(
-                chat_id=telegram_id,
-                text="У вас нет прав для этой команды."
-            )
-        else:
-            context.bot.send_message(
-                chat_id=telegram_id,
-                text=(
-                    "Введите текст после команды /broadcast, чтобы отправить его всем пользователям."
-                ),
-            )
-    elif data == "menu_close":
-        # Simply remove the inline keyboard by editing the message
-        query.edit_message_reply_markup(reply_markup=None)
-        context.bot.send_message(
-            chat_id=telegram_id,
-            text="Меню закрыто."
-        )
-    else:
-        # Unrecognized callback data
-        context.bot.send_message(
-            chat_id=telegram_id,
-            text="Неизвестная команда меню."
-        )
-    return ConversationHandler.END
+        return
+    now = datetime.utcnow()
+    new_expiration = now + timedelta(days=days)
+    database.set_subscription_status(
+        telegram_id,
+        active=True,
+        expiration_date=new_expiration.isoformat(),
+        is_trial=False,
+    )
+    # Clear trial flags if still present
+    database.clear_trial(telegram_id)
+    # Edit original message to confirm
+    query.edit_message_text(
+        f"Подписка продлена на {days} дней. Дата окончания: {new_expiration.date().isoformat()}"
+    )
 
 
 def main() -> None:
@@ -698,21 +774,33 @@ def main() -> None:
     update_handler = ConversationHandler(
         entry_points=[CommandHandler("update", update_personal_data)],
         states={
-            SELECT_FIELD: [CallbackQueryHandler(handle_update_callback)],
+            SELECT_FIELD: [MessageHandler(Filters.text & ~Filters.command, handle_update_selection)],
             TYPING_VALUE: [MessageHandler(Filters.text & ~Filters.command, handle_update_value)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     dispatcher.add_handler(update_handler)
-    # Menu and other commands
-    dispatcher.add_handler(CommandHandler("menu", menu))
+    # Menu conversation handler.  Presents a reply keyboard and captures
+    # the user's selection via `handle_menu_reply`.  The menu can be
+    # invoked multiple times and automatically hides after an option is
+    # chosen.
+    menu_handler = ConversationHandler(
+        entry_points=[CommandHandler("menu", menu)],
+        states={
+            MENU_ACTION: [MessageHandler(Filters.text & ~Filters.command, handle_menu_reply)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    dispatcher.add_handler(menu_handler)
+    # Other commands that can be called directly
     dispatcher.add_handler(CommandHandler("referrals", show_referrals))
     dispatcher.add_handler(CommandHandler("subscribe", subscribe))
     dispatcher.add_handler(CommandHandler("status", show_status))
     dispatcher.add_handler(CommandHandler("broadcast", broadcast, pass_args=True))
-    # Callback handler for main menu inline buttons.  Pattern ensures we only
-    # capture callbacks starting with 'menu_'.
-    dispatcher.add_handler(CallbackQueryHandler(handle_menu_callback, pattern=r"^menu_"))
+    # The inline menu callback handler has been removed; the main menu now
+    # uses a reply keyboard handled by the conversation above.
+    # Callback handler for subscription extension choices
+    dispatcher.add_handler(CallbackQueryHandler(handle_extension_callback, pattern=r"^extend_"))
     # Payment handlers
     dispatcher.add_handler(PreCheckoutQueryHandler(payments.process_precheckout_query))
     dispatcher.add_handler(MessageHandler(Filters.successful_payment, payments.handle_successful_payment))

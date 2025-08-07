@@ -72,6 +72,7 @@ def init_db() -> None:
     with _db_lock:
         with _get_connection() as conn:
             cursor = conn.cursor()
+            # Create the base table if it doesn't exist
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users (
@@ -87,10 +88,22 @@ def init_db() -> None:
                     points INTEGER DEFAULT 0,
                     subscription_active INTEGER DEFAULT 0,
                     subscription_expiration TEXT,
-                    registration_date TEXT
+                    registration_date TEXT,
+                    trial_expiration TEXT,
+                    is_trial INTEGER DEFAULT 0
                 )
                 """
             )
+            conn.commit()
+            # Ensure new columns exist when migrating from an old version
+            # SQLite doesn't support adding multiple columns in one statement easily,
+            # so we check for each column and add it if missing.
+            cursor.execute("PRAGMA table_info(users)")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+            if "trial_expiration" not in existing_columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN trial_expiration TEXT")
+            if "is_trial" not in existing_columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN is_trial INTEGER DEFAULT 0")
             conn.commit()
 
 
@@ -249,19 +262,39 @@ def update_points(telegram_id: int, points_delta: int) -> None:
 
 
 def set_subscription_status(
-    telegram_id: int, active: bool, expiration_date: Optional[str] = None
+    telegram_id: int,
+    active: bool,
+    expiration_date: Optional[str] = None,
+    *,
+    is_trial: Optional[bool] = None,
 ) -> None:
     """Update a user's subscription status.
 
-    If `active` is False, `expiration_date` will be cleared.
+    Parameters
+    ----------
+    telegram_id : int
+        The user's Telegram ID.
+    active : bool
+        Whether the subscription should be active.
+    expiration_date : str, optional
+        ISO formatted expiration date.  If `active` is False this is ignored and set to NULL.
+    is_trial : bool, optional
+        If provided, sets whether this subscription is a trial.  Trials are a form of
+        subscription that provide full access for a limited time; they may expire
+        independently of paid subscriptions.
     """
     with _db_lock:
         with _get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE users SET subscription_active = ?, subscription_expiration = ? WHERE telegram_id = ?",
-                (1 if active else 0, expiration_date if active else None, telegram_id),
-            )
+            # Build dynamic SQL to conditionally update is_trial
+            set_clauses = ["subscription_active = ?", "subscription_expiration = ?"]
+            params: list[Any] = [1 if active else 0, expiration_date if active else None]
+            if is_trial is not None:
+                set_clauses.append("is_trial = ?")
+                params.append(1 if is_trial else 0)
+            params.append(telegram_id)
+            sql = f"UPDATE users SET {', '.join(set_clauses)} WHERE telegram_id = ?"
+            cursor.execute(sql, params)
             conn.commit()
 
 
@@ -297,6 +330,20 @@ def get_subscribed_users() -> List[sqlite3.Row]:
                 (now_iso,),
             )
             conn.commit()
+            # Deactivate expired trials
+            cursor.execute(
+                """
+                UPDATE users
+                SET subscription_active = 0,
+                    subscription_expiration = NULL,
+                    is_trial = 0
+                WHERE is_trial = 1
+                  AND trial_expiration IS NOT NULL
+                  AND trial_expiration < ?
+                """,
+                (now_iso,),
+            )
+            conn.commit()
             # Retrieve active subscribers
             cursor.execute(
                 "SELECT * FROM users WHERE subscription_active = 1"
@@ -326,6 +373,56 @@ def list_referrals(telegram_id: int) -> List[sqlite3.Row]:
     user = get_user(telegram_id)
     if not user or not user["referral_code"]:
         return []
+
+
+def set_trial_expiration(telegram_id: int, expiration_date: str) -> None:
+    """Set or update the trial expiration date for a user.
+
+    Parameters
+    ----------
+    telegram_id : int
+        The user's Telegram ID.
+    expiration_date : str
+        ISO formatted date indicating when the trial should expire.
+    """
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET trial_expiration = ?, is_trial = 1 WHERE telegram_id = ?",
+                (expiration_date, telegram_id),
+            )
+            conn.commit()
+
+
+def get_trial_expiration(telegram_id: int) -> Optional[str]:
+    """Retrieve the trial expiration date for a user, if any."""
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT trial_expiration FROM users WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+
+def clear_trial(telegram_id: int) -> None:
+    """Clear the trial flags for a user.
+
+    After a trial expires or the user purchases a subscription, this
+    resets the trial fields so they no longer affect subscription
+    logic.
+    """
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET is_trial = 0, trial_expiration = NULL WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+            conn.commit()
     code = user["referral_code"]
     with _db_lock:
         with _get_connection() as conn:
