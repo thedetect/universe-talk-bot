@@ -1,8 +1,0 @@
-# secrets
-.env
-creds.json
-credentials.json
-
-# python
-__pycache__/
-*.pyc
