@@ -3,3 +3,4 @@ APScheduler==3.6.3
 skyfield
 pytz
 tornado
+urllib3==1.26.18
