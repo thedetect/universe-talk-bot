@@ -1,6 +1,4 @@
-creds.json
-credentials.json
-render.yaml
+__pycache__/
+*.pyc
+*.db
 .env
-
-.DS_Store
