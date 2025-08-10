@@ -1,210 +1,421 @@
+# -*- coding: utf-8 -*-
+"""
+bot.py — универсальный запускатель бота (PTB 13.15) с корректным webhook-режимом.
 
-from __future__ import annotations
-import os, logging
+Окружение (Render → Settings → Environment):
+  TELEGRAM_BOT_TOKEN   — токен бота (обязательно, новый после revoke)
+  USE_WEBHOOK          — "1" (включить вебхук) или "0" (polling)
+  PUBLIC_URL           — https://<твой-сервис>.onrender.com  (только при USE_WEBHOOK=1)
+  WEBHOOK_SECRET       — длинная случайная строка (только при USE_WEBHOOK=1)
+  DB_PATH              — /opt/render/project/src/user_data.db  (если нет диска /data)
+                          или /data/user_data.db (если подключён Persistent Disk)
+  TZ                   — Europe/Berlin
+  PYTHONUNBUFFERED     — 1
+"""
+
+import os
+import logging
+import sqlite3
+from contextlib import closing
 from datetime import datetime
-from functools import wraps
 
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
+import pytz
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update, ParseMode
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    CallbackContext,
+    ConversationHandler,
+)
 
-from . import config, database, referral, astrology, payments
+# ==== безопасные импорты локальных модулей (если их нет — бот всё равно поднимется) ====
+try:
+    # твой конфиг (если есть)
+    from .config import (
+        TELEGRAM_BOT_TOKEN as CFG_TOKEN,
+        PUBLIC_URL as CFG_PUBLIC_URL,
+        WEBHOOK_SECRET as CFG_WEBHOOK_SECRET,
+        USE_WEBHOOK as CFG_USE_WEBHOOK,
+        ADMIN_IDS as CFG_ADMIN_IDS,
+        DB_PATH as CFG_DB_PATH,
+    )
+except Exception:
+    CFG_TOKEN = CFG_PUBLIC_URL = CFG_WEBHOOK_SECRET = None
+    CFG_USE_WEBHOOK = None
+    CFG_ADMIN_IDS = []
+    CFG_DB_PATH = None
 
-logging.basicConfig(format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
+try:
+    # твой модуль БД, если есть
+    from . import database as db
+except Exception:
+    db = None
 
-NAME, BIRTH_DATE, BIRTH_PLACE, BIRTH_TIME, NOTIFY_TIME, MENU = range(6)
+# (необязательные модули; если есть — используем)
+try:
+    from . import referral
+except Exception:
+    referral = None
 
-def admin_only(func):
-    @wraps(func)
-    def wrapper(update: Update, context: CallbackContext, *a, **kw):
-        uid = update.effective_user.id
-        if uid not in config.ADMIN_IDS:
-            update.message.reply_text("Эта команда доступна только админу.")
-            return
-        return func(update, context, *a, **kw)
-    return wrapper
+try:
+    from . import payments
+except Exception:
+    payments = None
 
-def _main_keyboard():
-    return ReplyKeyboardMarkup([
-        ["Изменить время", "Рефералы"],
-        ["Подписка", "Статус"],
-        ["Обновить данные"],
-        ["Закрыть меню"]
-    ], resize_keyboard=True, one_time_keyboard=True)
+try:
+    from . import astrology
+except Exception:
+    astrology = None
 
-def _valid_time(s: str) -> bool:
+# ============================ ЛОГИ ============================
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s | %(name)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("bot")
+
+# ============================ КОНФИГ ============================
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", CFG_TOKEN or "").strip()
+USE_WEBHOOK = str(os.getenv("USE_WEBHOOK", CFG_USE_WEBHOOK if CFG_USE_WEBHOOK is not None else "1")).strip()
+PUBLIC_URL = os.getenv("PUBLIC_URL", CFG_PUBLIC_URL or "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", CFG_WEBHOOK_SECRET or "").strip()
+DB_PATH = os.getenv("DB_PATH", CFG_DB_PATH or "/opt/render/project/src/user_data.db").strip()
+TZ = os.getenv("TZ", "Europe/Berlin")
+TZINFO = pytz.timezone(TZ)
+
+ADMIN_IDS = set()
+for raw in (os.getenv("ADMIN_IDS", "") or ",").split(","):
+    raw = raw.strip()
+    if raw.isdigit():
+        ADMIN_IDS.add(int(raw))
+for v in (CFG_ADMIN_IDS or []):
     try:
-        datetime.strptime(s, "%H:%M"); return True
-    except: return False
+        ADMIN_IDS.add(int(v))
+    except Exception:
+        pass
 
-def _schedule_daily_jobs(updater: Updater):
-    jq = updater.job_queue
-    jq.stop(); jq.start()
-    for u in database.get_all_users():
-        t = (u.get("notify_time") or "09:00")
-        try: hh, mm = [int(x) for x in t.split(":")]
-        except: hh, mm = 9, 0
-        def send_daily(ctx: CallbackContext, uid=u["telegram_id"], user=u):
-            database.use_bonus_days_if_needed(uid)
-            if database.has_access(uid):
-                try: msg = astrology.daily_message(user)
-                except Exception: msg = "Сегодня космос немного занят, но ты — нет. Сделай маленький шаг к мечте! ✨"
-                ctx.bot.send_message(chat_id=uid, text=msg)
+def truthy(v) -> bool:
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+# ============================ ПРОСТЕЙШАЯ БД (fallback, если нет твоего database.py) ============================
+def _fallback_init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    with closing(sqlite3.connect(DB_PATH, check_same_thread=False)) as con:
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            user_id     INTEGER PRIMARY KEY,
+            chat_id     INTEGER,
+            name        TEXT,
+            birth_date  TEXT,
+            birth_place TEXT,
+            birth_time  TEXT,
+            daily_time  TEXT,
+            created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS referrals(
+            user_id     INTEGER PRIMARY KEY,
+            code        TEXT,
+            invited_cnt INTEGER DEFAULT 0,
+            bonus_days  INTEGER DEFAULT 0
+        );
+        """)
+        con.commit()
+
+def _fallback_get_user(uid: int):
+    with closing(sqlite3.connect(DB_PATH, check_same_thread=False)) as con:
+        cur = con.execute("SELECT user_id, chat_id, name, birth_date, birth_place, birth_time, daily_time FROM users WHERE user_id=?", (uid,))
+        row = cur.fetchone()
+        return row
+
+def _fallback_upsert_user(uid: int, chat_id: int):
+    with closing(sqlite3.connect(DB_PATH, check_same_thread=False)) as con:
+        con.execute(
+            "INSERT INTO users(user_id, chat_id) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id",
+            (uid, chat_id),
+        )
+        con.commit()
+
+def _fallback_update_field(uid: int, field: str, value: str):
+    if field not in {"name", "birth_date", "birth_place", "birth_time", "daily_time"}:
+        return
+    with closing(sqlite3.connect(DB_PATH, check_same_thread=False)) as con:
+        con.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (value, uid))
+        con.commit()
+
+def _fallback_all_chat_ids():
+    with closing(sqlite3.connect(DB_PATH, check_same_thread=False)) as con:
+        cur = con.execute("SELECT chat_id FROM users WHERE chat_id IS NOT NULL")
+        return [r[0] for r in cur.fetchall()]
+
+# Обёртки — используем твой database.py, если есть; иначе fallback
+def init_db():
+    try:
+        if db:  # твой модуль
+            db.init_db()
+        else:
+            _fallback_init_db()
+        log.info("DB ready at %s", DB_PATH)
+    except Exception as e:
+        log.exception("DB init failed: %s", e)
+        _fallback_init_db()
+
+def ensure_user(uid: int, chat_id: int):
+    try:
+        if db:
+            if not db.get_user(uid):
+                db.create_or_update_user(uid, chat_id=chat_id)
             else:
-                ctx.bot.send_message(chat_id=uid,
-                    text=("Пробный период закончился. "
-                          "Продлить подписку: /subscribe или использовать бонусные дни от рефералов: /referrals"))
-        from datetime import time as _time
-        jq.run_daily(send_daily, time=_time(hour=hh, minute=mm), name=f"daily_{u['telegram_id']}")
+                db.create_or_update_user(uid, chat_id=chat_id)
+        else:
+            _fallback_upsert_user(uid, chat_id)
+    except Exception:
+        _fallback_upsert_user(uid, chat_id)
+
+def update_field(uid: int, field: str, value: str):
+    try:
+        if db:
+            db.update_user_field(uid, field, value)
+        else:
+            _fallback_update_field(uid, field, value)
+    except Exception:
+        _fallback_update_field(uid, field, value)
+
+def get_user(uid: int):
+    try:
+        if db:
+            return db.get_user(uid)
+        return _fallback_get_user(uid)
+    except Exception:
+        return _fallback_get_user(uid)
+
+def all_chat_ids():
+    try:
+        if db:
+            return db.get_all_chat_ids()
+        return _fallback_all_chat_ids()
+    except Exception:
+        return _fallback_all_chat_ids()
+
+# ============================ КЛАВИАТУРЫ ============================
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        ["⚙️ Обновить данные", "🕒 Время рассылки"],
+        ["💳 Подписка", "👥 Рефералы"],
+        ["❌ Закрыть меню"],
+    ],
+    resize_keyboard=True,
+)
+
+UPDATE_KB = ReplyKeyboardMarkup(
+    [
+        ["Имя", "Дата рождения"],
+        ["Место рождения", "Время рождения"],
+        ["Оставить всё как есть"],
+    ],
+    resize_keyboard=True,
+)
+
+# ============================ ХЕНДЛЕРЫ ============================
+CHOOSING, TYPING_VALUE = range(2)
 
 def start(update: Update, context: CallbackContext):
-    database.init_db()
     user = update.effective_user
-    if context.args:
-        code = context.args[0]
-        try: referral.handle_referral(user.id, code)
-        except Exception as e: logger.warning("Referral error: %s", e)
-    database.upsert_user(user.id, created_at=datetime.utcnow().isoformat())
-    database.award_trial_if_needed(user.id)
-    update.message.reply_text("Привет! Давай познакомимся. Как тебя зовут?")
-    return NAME
+    ensure_user(user.id, update.effective_chat.id)
+    msg = (
+        f"Привет, {user.first_name or 'друг'}! 🌟\n\n"
+        "Я твой персональный астро-ассистент. Жми /menu, чтобы настроить профиль, "
+        "установить время ежедневной рассылки и посмотреть рефералов."
+    )
+    update.message.reply_text(msg)
 
-def name_step(update: Update, context: CallbackContext):
-    name = update.message.text.strip()
-    database.upsert_user(update.effective_user.id, name=name)
-    update.message.reply_text("Дата рождения (ДД.ММ.ГГГГ)?")
-    return BIRTH_DATE
+def menu(update: Update, context: CallbackContext):
+    update.message.reply_text("Выберите действие:", reply_markup=MAIN_KB)
 
-def bdate_step(update: Update, context: CallbackContext):
-    s = update.message.text.strip()
-    try:
-        d, m, y = [int(x) for x in s.split(".")]
-        datetime(y,m,d)
-    except:
-        update.message.reply_text("Формат должен быть ДД.ММ.ГГГГ. Попробуем ещё раз:"); return BIRTH_DATE
-    database.upsert_user(update.effective_user.id, birth_date=s)
-    update.message.reply_text("Место рождения (город, страна)?"); return BIRTH_PLACE
+def close_menu(update: Update, context: CallbackContext):
+    update.message.reply_text("Меню закрыто.", reply_markup=ReplyKeyboardRemove())
 
-def bplace_step(update: Update, context: CallbackContext):
-    place = update.message.text.strip()
-    database.upsert_user(update.effective_user.id, birth_place=place)
-    update.message.reply_text("Время рождения (ЧЧ:ММ)? Если не знаешь — напиши 12:00"); return BIRTH_TIME
+def status(update: Update, context: CallbackContext):
+    uid = update.effective_user.id
+    u = get_user(uid)
+    # очень простой статус
+    when = None
+    if u:
+        # индексы в fallback-е: (user_id, chat_id, name, birth_date, birth_place, birth_time, daily_time)
+        when = u[6] if len(u) >= 7 else None
+    txt = ["Статус подписки: демо (без платежей пока)"]
+    if when:
+        txt.append(f"Время ежедневной рассылки: {when}")
+    update.message.reply_text("\n".join(txt))
 
-def btime_step(update: Update, context: CallbackContext):
-    t = update.message.text.strip()
-    if not _valid_time(t):
-        update.message.reply_text("Формат должен быть ЧЧ:ММ, например 18:25. Введи ещё раз:"); return BIRTH_TIME
-    database.upsert_user(update.effective_user.id, birth_time=t)
-    update.message.reply_text("Во сколько каждый день присылать сообщение? (ЧЧ:ММ)"); return NOTIFY_TIME
-
-def ntime_step(update: Update, context: CallbackContext):
-    t = update.message.text.strip()
-    if not _valid_time(t):
-        update.message.reply_text("Формат должен быть ЧЧ:ММ. Введи ещё раз:"); return NOTIFY_TIME
-    database.upsert_user(update.effective_user.id, notify_time=t)
-    code = referral.assign_referral_code(update.effective_user.id)
-    update.message.reply_text(
-        "Отлично! Настройка завершена.\n"
-        f"Твоя реферальная ссылка: https://t.me/{context.bot.username}?start={code}\n\n"
-        "Открой /menu, чтобы управлять ботом.", reply_markup=_main_keyboard())
-    return ConversationHandler.END
-
-def menu_cmd(update: Update, context: CallbackContext):
-    update.message.reply_text("\u200b", reply_markup=_main_keyboard()); return MENU
-
-def menu_router(update: Update, context: CallbackContext):
-    txt = (update.message.text or "").strip().lower()
-    if "изменить время" in txt:
-        update.message.reply_text("Введи новое время (ЧЧ:ММ):", reply_markup=ReplyKeyboardRemove()); return NOTIFY_TIME
-    if "реферал" in txt:
-        st = referral.get_referral_status(update.effective_user.id)
-        update.message.reply_text(
-            f"Твоя ссылка: https://t.me/{context.bot.username}?start={st['code']}\n"
-            f"Приглашённых: {st['count']}\n"
-            f"Бонусные дни: {st['bonus_days']}\n"
-            f"Приглашённые: {', '.join(st['invited']) or '—'}", reply_markup=ReplyKeyboardRemove())
-        return ConversationHandler.END
-    if "подписка" in txt:
-        update.message.reply_text(payments.offer_subscriptions_text(), reply_markup=ReplyKeyboardRemove()); return ConversationHandler.END
-    if "статус" in txt:
-        u = database.get_user(update.effective_user.id) or {}
-        update.message.reply_text(
-            f"Триал до: {u.get('trial_expiration') or '—'}\n"
-            f"Подписка до: {u.get('subscription_until') or '—'}\n"
-            f"Бонусные дни: {u.get('points') or 0}", reply_markup=ReplyKeyboardRemove()); return ConversationHandler.END
-    if "обновить данные" in txt:
-        update.message.reply_text("Введи имя:", reply_markup=ReplyKeyboardRemove()); return NAME
-    if "закрыть меню" in txt:
-        update.message.reply_text("Меню закрыто.", reply_markup=ReplyKeyboardRemove()); return ConversationHandler.END
-    update.message.reply_text("Выбери пункт меню.", reply_markup=_main_keyboard()); return MENU
-
-def settime_direct(update: Update, context: CallbackContext):
-    t = update.message.text.strip()
-    if not _valid_time(t):
-        update.message.reply_text("Формат должен быть ЧЧ:ММ. Попробуй ещё раз:"); return NOTIFY_TIME
-    database.upsert_user(update.effective_user.id, notify_time=t)
-    update.message.reply_text(f"Готово. Новое время: {t}"); return ConversationHandler.END
+def referrals(update: Update, context: CallbackContext):
+    uid = update.effective_user.id
+    bot_username = context.bot.username or "bot"
+    code = str(uid)
+    link = f"https://t.me/{bot_username}?start={code}"
+    invited = 0
+    bonus_days = 0
+    if referral:
+        try:
+            s = referral.get_stats(uid)
+            invited = s.get("invited", 0)
+            bonus_days = s.get("bonus_days", 0)
+        except Exception:
+            pass
+    text = (
+        f"Твоя реферальная ссылка:\n{link}\n\n"
+        f"Приглашённых: {invited}\n"
+        f"Бонусные дни: {bonus_days}"
+    )
+    update.message.reply_text(text, disable_web_page_preview=True)
 
 def subscribe(update: Update, context: CallbackContext):
-    update.message.reply_text(payments.offer_subscriptions_text())
-
-def extend_30(update, ctx): payments.handle_extend(update, ctx, 30)
-def extend_60(update, ctx): payments.handle_extend(update, ctx, 60)
-def extend_90(update, ctx): payments.handle_extend(update, ctx, 90)
-def extend_120(update, ctx): payments.handle_extend(update, ctx, 120)
-def extend_180(update, ctx): payments.handle_extend(update, ctx, 180)
-
-def referrals_cmd(update: Update, context: CallbackContext):
-    st = referral.get_referral_status(update.effective_user.id)
     update.message.reply_text(
-        f"Твоя ссылка: https://t.me/{context.bot.username}?start={st['code']}\n"
-        f"Приглашённых: {st['count']}\nБонусные дни: {st['bonus_days']}")
-
-def error_handler(update: object, context: CallbackContext):
-    logger.exception("Bot error: %s", context.error)
-
-def main():
-    database.init_db()
-
-    up = Updater(token=config.BOT_TOKEN, use_context=True)
-    dp = up.dispatcher
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start), CommandHandler("menu", menu_cmd)],
-        states={
-            NAME: [MessageHandler(Filters.text & ~Filters.command, name_step)],
-            BIRTH_DATE: [MessageHandler(Filters.text & ~Filters.command, bdate_step)],
-            BIRTH_PLACE: [MessageHandler(Filters.text & ~Filters.command, bplace_step)],
-            BIRTH_TIME: [MessageHandler(Filters.text & ~Filters.command, btime_step)],
-            NOTIFY_TIME: [MessageHandler(Filters.text & ~Filters.command, ntime_step)],
-            MENU: [MessageHandler(Filters.text & ~Filters.command, menu_router)],
-        },
-        fallbacks=[CommandHandler("menu", menu_cmd)],
+        "Платёжка будет подключена позже. Пока доступен демо-режим.\n"
+        "Когда будешь готов — напомни командой /subscribe.",
     )
-    dp.add_handler(conv)
+
+def settime(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "Введи время в формате ЧЧ:ММ (например, 08:30):", reply_markup=ReplyKeyboardRemove()
+    )
+    context.user_data["await_time"] = True
+
+def text_router(update: Update, context: CallbackContext):
+    text = (update.message.text or "").strip()
+
+    # обработка времени рассылки
+    if context.user_data.pop("await_time", False):
+        try:
+            hh, mm = text.split(":")
+            hh, mm = int(hh), int(mm)
+            assert 0 <= hh < 24 and 0 <= mm < 60
+        except Exception:
+            update.message.reply_text("Неверный формат. Пример: 08:30. Попробуй ещё раз /settime.")
+            return
+        update_field(update.effective_user.id, "daily_time", f"{hh:02d}:{mm:02d}")
+        update.message.reply_text("Готово! Время сохранено.", reply_markup=MAIN_KB)
+        return
+
+    # выбор поля для обновления
+    if text in {"Имя", "Дата рождения", "Место рождения", "Время рождения"}:
+        context.user_data["update_field"] = text
+        update.message.reply_text("Введи новое значение:", reply_markup=ReplyKeyboardRemove())
+        context.user_data["await_value"] = True
+        return
+
+    if text == "Оставить всё как есть":
+        update.message.reply_text("Ок, без изменений.", reply_markup=MAIN_KB)
+        context.user_data.pop("update_field", None)
+        context.user_data.pop("await_value", None)
+        return
+
+    # ввод значения для выбранного поля
+    if context.user_data.pop("await_value", False):
+        fld_map = {
+            "Имя": "name",
+            "Дата рождения": "birth_date",
+            "Место рождения": "birth_place",
+            "Время рождения": "birth_time",
+        }
+        fld = fld_map.get(context.user_data.get("update_field"))
+        if fld:
+            update_field(update.effective_user.id, fld, text)
+            update.message.reply_text("Обновлено ✅", reply_markup=MAIN_KB)
+        else:
+            update.message.reply_text("Что-то пошло не так. Попробуй /update ещё раз.", reply_markup=MAIN_KB)
+        context.user_data.pop("update_field", None)
+        return
+
+    # всплывающее меню
+    if text in {"⚙️ Обновить данные"}:
+        return update_cmd(update, context)
+    if text in {"🕒 Время рассылки"}:
+        return settime(update, context)
+    if text in {"💳 Подписка"}:
+        return subscribe(update, context)
+    if text in {"👥 Рефералы"}:
+        return referrals(update, context)
+    if text in {"❌ Закрыть меню"}:
+        return close_menu(update, context)
+
+def update_cmd(update: Update, context: CallbackContext):
+    update.message.reply_text("Что вы хотите изменить?", reply_markup=UPDATE_KB)
+
+def unknown(update: Update, context: CallbackContext):
+    update.message.reply_text("Не понял команду. Попробуй /menu.")
+
+def broadcast(update: Update, context: CallbackContext):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        update.message.reply_text("Команда только для администратора.")
+        return
+    text = " ".join(context.args).strip()
+    if not text:
+        update.message.reply_text("Пример: /broadcast Текст рассылки")
+        return
+    ok = 0
+    for chat_id in all_chat_ids():
+        try:
+            context.bot.send_message(chat_id=chat_id, text=text)
+            ok += 1
+        except Exception:
+            pass
+    update.message.reply_text(f"Готово. Разослано: {ok}")
+
+# ============================ РЕГИСТРАЦИЯ ХЕНДЛЕРОВ ============================
+def register_handlers(dp):
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("menu", menu))
+    dp.add_handler(CommandHandler("status", status))
+    dp.add_handler(CommandHandler("referrals", referrals))
     dp.add_handler(CommandHandler("subscribe", subscribe))
-    dp.add_handler(CommandHandler("referrals", referrals_cmd))
-    dp.add_handler(CommandHandler("extend_30", extend_30))
-    dp.add_handler(CommandHandler("extend_60", extend_60))
-    dp.add_handler(CommandHandler("extend_90", extend_90))
-    dp.add_handler(CommandHandler("extend_120", extend_120))
-    dp.add_handler(CommandHandler("extend_180", extend_180))
-    dp.add_error_handler(error_handler)
+    dp.add_handler(CommandHandler("settime", settime))
+    dp.add_handler(CommandHandler("update", update_cmd))
+    dp.add_handler(CommandHandler("broadcast", broadcast, pass_args=True))
 
-    _schedule_daily_jobs(up)
+    # общий текстовый роутер (кнопки и ввод)
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, text_router))
+    dp.add_handler(MessageHandler(Filters.command, unknown))
 
-    use_webhook = os.getenv("USE_WEBHOOK", "0") == "1"
-    if use_webhook:
-        public_url = os.getenv("PUBLIC_URL")
-        secret = os.getenv("WEBHOOK_SECRET") or config.WEBHOOK_SECRET
+# ============================ ЗАПУСК (WEBHOOK/POLLING) ============================
+def run_bot() -> None:
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
+    # Готовим БД
+    init_db()
+
+    # Updater + handlers
+    updater = Updater(token=TOKEN, use_context=True)
+    dp = updater.dispatcher
+    register_handlers(dp)
+
+    if truthy(USE_WEBHOOK):
+        public_url = PUBLIC_URL.rstrip("/")
+        secret = WEBHOOK_SECRET
         if not public_url or not secret:
-            raise RuntimeError("PUBLIC_URL and WEBHOOK_SECRET must be set for webhook mode")
+            raise RuntimeError("PUBLIC_URL/WEBHOOK_SECRET must be set for webhook mode")
+
         port = int(os.environ.get("PORT", "10000"))
-        up.start_webhook(listen="0.0.0.0", port=port, url_path=secret)
-        up.bot.set_webhook(f"{public_url.rstrip('/')}/{secret}")
-        up.idle()
+
+        # ВАЖНО: передаём внешний webhook_url, чтобы Telegram видел порт 80/443 на Render,
+        # а не внутренний $PORT. Дополнительно НИЧЕГО не вызываем (никакого bot.set_webhook).
+        updater.start_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=secret,
+            webhook_url=f"{public_url}/{secret}",
+        )
+        log.info("Webhook started: %s/%s (listen 0.0.0.0:%s)", public_url, secret, port)
+        updater.idle()
     else:
-        up.start_polling(); up.idle()
+        updater.start_polling(clean=True)
+        log.info("Polling started")
+        updater.idle()
 
 if __name__ == "__main__":
-    main()
+    run_bot()
