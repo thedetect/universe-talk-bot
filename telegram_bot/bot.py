@@ -1,426 +1,594 @@
-# telegram_bot/bot.py
 # -*- coding: utf-8 -*-
+"""
+ГЛАВНЫЙ ФАЙЛ БОТА.
+Запуск:  python -m telegram_bot.bot
 
-import logging
+Требует ENV:
+  BOT_TOKEN
+  PUBLIC_URL = https://universe-talk-bot.onrender.com
+  WEBHOOK_SECRET
+  PORT = 10000
+  USE_WEBHOOK = 1
+  TZ = Europe/Berlin
+  DB_PATH = /data/user_data_v2.db
+  ADMIN_IDS = 12345,67890
+  REFERRAL_BONUS_DAYS = 0 (или число)
+  PYTHONUNBUFFERED = 1
+"""
+
 import os
 import re
-from datetime import datetime
-from typing import Optional
+import json
+import sqlite3
+import logging
+from datetime import datetime, time as dtime, timedelta, timezone
+from typing import Optional, Dict, Any
 
 import pytz
-from apscheduler.schedulers.background import BackgroundScheduler
-from telegram import ParseMode, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from apscheduler.triggers.cron import CronTrigger
+from telegram import (
+    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, ParseMode,
+    InputFile,
+)
 from telegram.ext import (
-    Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+    Updater, CallbackContext, CommandHandler, MessageHandler, Filters,
+    ConversationHandler,
 )
 
-from telegram_bot import database
-from telegram_bot.astrology import generate_daily_message, UserData
+# Если используешь генератор сообщений из своего модуля:
+try:
+    from .astrology import generate_daily_message  # type: ignore
+except Exception:
+    # запасной генератор на случай отсутствия модуля
+    def generate_daily_message(user_row: Dict[str, Any]) -> str:
+        name = user_row.get("name") or "друг"
+        return (
+            f"Доброе утро, {name}!\n\n"
+            "Сегодня — хороший день, чтобы сделать маленький шаг к важной цели. "
+            "Один звонок, одно письмо, одна мысль — и вселенная подхватит тебя. 🌟\n\n"
+            "Вопрос дня: какой шаг подарит мне ощущение движения прямо сейчас?"
+        )
 
-# ---------- ЛОГИ ----------
+# -------------------- НАСТРОЙКИ/ENV --------------------
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+USE_WEBHOOK = os.getenv("USE_WEBHOOK", "1") in ("1", "true", "True", "yes", "YES")
+PORT = int(os.getenv("PORT", "10000"))
+DB_PATH = os.getenv("DB_PATH", "/data/user_data_v2.db")
+SERVER_TZ = os.getenv("TZ", "Europe/Berlin")
+
+ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", os.getenv("ADMIN_IDS", "").strip()) if x}
+REFERRAL_BONUS_DAYS = int(os.getenv("REFERRAL_BONUS_DAYS", "0"))
+
+# -------------------- ЛОГИ --------------------
+
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s | %(message)s", level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s"
 )
 log = logging.getLogger("bot")
 
-# ---------- ОКРУЖЕНИЕ ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "secret")
-PORT = int(os.getenv("PORT", "10000"))
+# -------------------- DB --------------------
 
-REFERRAL_BONUS_DAYS = int(os.getenv("REFERRAL_BONUS_DAYS", "10"))
-PROJECT_TZ = os.getenv("TZ", "Europe/Berlin")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+def init_db() -> None:
+    conn = db()
+    cur = conn.cursor()
+    cur.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id        INTEGER PRIMARY KEY,
+            chat_id        INTEGER,
+            name           TEXT,
+            birth_date     TEXT,
+            birth_place    TEXT,
+            birth_time     TEXT,
+            tz             TEXT DEFAULT 'Europe/Berlin',
+            send_time      TEXT DEFAULT '09:00', -- HH:MM в часовом поясе пользователя
+            is_blocked     INTEGER DEFAULT 0,
 
-scheduler = BackgroundScheduler(timezone=pytz.timezone(PROJECT_TZ))
+            is_subscribed  INTEGER DEFAULT 0,
+            sub_until      TEXT,               -- ISO timestamp в UTC
+            bonus_days     INTEGER DEFAULT 0,
 
-# ---------- МЕНЮ ----------
-def main_menu(is_admin: bool) -> ReplyKeyboardMarkup:
-    rows = [
-        ["🕒 Изменить время", "🌍 Часовой пояс"],
-        ["🧾 Обновить данные", "ℹ️ Мой статус"],
-        ["⏰ Мой запуск (/mytime)"],
+            referrer_id    INTEGER,
+            ref_bonus_given INTEGER DEFAULT 0,
+
+            created_at     TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_users_sendtime ON users(send_time);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return dict(row) if row else {}
+
+def get_user(user_id: int) -> Dict[str, Any]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    r = cur.fetchone()
+    conn.close()
+    return row_to_dict(r)
+
+def upsert_user(user_id: int, chat_id: Optional[int] = None) -> None:
+    conn = db()
+    cur = conn.cursor()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    if cur.fetchone():
+        if chat_id:
+            cur.execute("UPDATE users SET chat_id=? WHERE user_id=?", (chat_id, user_id))
+    else:
+        cur.execute(
+            "INSERT INTO users(user_id, chat_id, created_at) VALUES(?,?,?)",
+            (user_id, chat_id, now_iso),
+        )
+    conn.commit()
+    conn.close()
+
+def update_user(user_id: int, **fields: Any) -> None:
+    if not fields:
+        return
+    keys = ", ".join([f"{k}=?" for k in fields.keys()])
+    values = list(fields.values()) + [user_id]
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE users SET {keys} WHERE user_id=?", values)
+    conn.commit()
+    conn.close()
+
+def all_users() -> list:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE is_blocked=0")
+    rows = [row_to_dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+# -------------------- УТИЛИТЫ --------------------
+
+def _parse_iso(dt: str):
+    try:
+        return datetime.fromisoformat(dt.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def can_receive_today(u: Dict[str, Any]) -> bool:
+    """
+    Безопасная логика допуска к рассылке:
+      - активная подписка, или
+      - bonus_days > 0, или
+      - триал 10 дней с момента регистрации, или
+      - sub_until в будущем.
+    НИКОГДА не кидает KeyError, даже если поля нет.
+    """
+    if not u or u.get("is_blocked"):
+        return False
+
+    is_sub = bool(u.get("is_subscribed"))
+    if is_sub:
+        return True
+
+    bonus_days = int(u.get("bonus_days") or 0)
+    if bonus_days > 0:
+        return True
+
+    now = datetime.now(timezone.utc)
+    sub_until = u.get("sub_until")
+    if sub_until:
+        dt = _parse_iso(sub_until)
+        if dt and dt > now:
+            return True
+
+    created_at = _parse_iso(u.get("created_at") or "")
+    if created_at and (now - created_at).days < 10:
+        return True
+
+    return False
+
+def parse_time_hhmm(s: str) -> Optional[dtime]:
+    m = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", s.strip())
+    if not m:
+        return None
+    return dtime(int(m.group(1)), int(m.group(2)))
+
+def user_tz(u: Dict[str, Any]) -> pytz.BaseTzInfo:
+    tz_name = u.get("tz") or "Europe/Berlin"
+    try:
+        return pytz.timezone(tz_name)
+    except Exception:
+        return pytz.timezone("Europe/Berlin")
+
+def send_main_menu(update: Update, context: CallbackContext, text: str = "Выберите действие:") -> None:
+    uid = update.effective_user.id
+    is_admin = uid in ADMIN_IDS
+    kb = [
+        ["🕒 Изменить время", "🗺 Часовой пояс"],
+        ["📝 Обновить анкету", "📣 Рефералы"],
+        ["🔔 Статус", "❌ Отмена"],
     ]
     if is_admin:
-        rows.append(["⚙️ Админка"])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+        kb.append(["👑 Админка"])
+    update.message.reply_text(text, reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
 
-UPDATE_MENU = ReplyKeyboardMarkup(
-    [
-        ["Имя", "Дата рождения"],
-        ["Место рождения", "Время рождения"],
-        ["⬅️ Оставить как есть"],
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=True,
-)
+# -------------------- РАССЫЛКА --------------------
 
-ADMIN_MENU = ReplyKeyboardMarkup(
-    [
-        ["📣 Рассылка", "➕ Бонусы"],
-        ["🚫 Блокировка", "👀 Статистика"],
-        ["⬅️ В меню"],
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=False,
-)
+def build_daily_text(user_row: Dict[str, Any]) -> str:
+    # Подставляем твой генератор (астрология/skyfield)
+    msg = generate_daily_message(user_row)
+    # Можно добавить «девиз дня» из базы/файла, если нужно
+    return msg
 
+def job_name(uid: int) -> str:
+    return f"user-{uid}"
 
-def reply_menu(update: Update, text: str) -> None:
-    uid = update.effective_user.id
-    update.effective_message.reply_text(text, reply_markup=main_menu(uid in ADMIN_IDS))
+def schedule_user_job(context: CallbackContext, u: Dict[str, Any]) -> None:
+    """Создаём/пересоздаём ежедневную джобу для пользователя по его TZ и времени."""
+    uid = u["user_id"]
+    st = u.get("send_time") or "09:00"
+    t = parse_time_hhmm(st) or dtime(9, 0)
+    tz = user_tz(u)
 
+    # удаляем старую
+    for j in context.job_queue.get_jobs_by_name(job_name(uid)):
+        j.remove()
 
-# ---------- ДОСТУПНОСТЬ РАССЫЛКИ ----------
-def _parse_date(d: Optional[str]):
-    if not d:
-        return None
-    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(d, fmt).date()
-        except Exception:
-            pass
+    trigger = CronTrigger(hour=t.hour, minute=t.minute, second=0, timezone=tz)
+    context.job_queue.run_job(
+        func=send_daily_job,
+        name=job_name(uid),
+        job_kwargs={"trigger": trigger},
+        context={"user_id": uid},
+    )
+    log.info("Scheduled user %s at %s (%s)", uid, st, tz)
+
+def reschedule_all(context: CallbackContext) -> None:
+    users = all_users()
+    for u in users:
+        if u.get("send_time"):
+            schedule_user_job(context, u)
+
+def send_daily_job(context: CallbackContext) -> None:
+    """Вызывается APScheduler-ом по расписанию."""
+    try:
+        uid = context.job.context["user_id"]
+        u = get_user(uid)
+        if not u:
+            return
+        if not can_receive_today(u):
+            return
+        chat_id = u.get("chat_id")
+        if not chat_id:
+            return
+        text = build_daily_text(u)
+        context.bot.send_message(chat_id=chat_id, text=text)
+        # если расходуем бонусные дни — уменьшаем
+        if not u.get("is_subscribed"):
+            bd = int(u.get("bonus_days") or 0)
+            if bd > 0:
+                update_user(uid, bonus_days=bd - 1)
+    except Exception:
+        log.exception("send_daily_job error")
+
+# -------------------- РЕФЕРАЛЫ --------------------
+
+def handle_deeplink_ref(update: Update) -> Optional[int]:
+    """Возвращает referrer_id, если стартовали с параметром."""
+    args = update.message.text.strip().split(maxsplit=1)
+    if len(args) == 2 and args[0].lower().startswith("/start"):
+        ref = args[1].strip()
+        if ref.isdigit():
+            return int(ref)
     return None
 
+def accrue_ref_bonus(new_user_id: int, referrer_id: int) -> None:
+    """Начисляем бонусные дни рефереру, если это НЕ самореферал и ещё не начисляли."""
+    if referrer_id == new_user_id:
+        return
+    r = get_user(referrer_id)
+    if not r:
+        return
+    if int(r.get("is_blocked") or 0):
+        return
+    # проверка уже выдавали или нет
+    u_new = get_user(new_user_id)
+    if int(u_new.get("ref_bonus_given") or 0):
+        return
+    bonus = REFERRAL_BONUS_DAYS
+    if bonus > 0:
+        new_bonus = int(r.get("bonus_days") or 0) + bonus
+        update_user(referrer_id, bonus_days=new_bonus)
+    update_user(new_user_id, ref_bonus_given=1, referrer_id=referrer_id)
 
-def can_receive_today(u: dict):
-    status = (u.get("subscription_status") or "").lower()
-    trial_until_raw = u.get("trial_until") or u.get("sub_until") or u.get("subscription_until")
-    bonus_days = int(u.get("bonus_days") or 0)
+# -------------------- ДИАЛОГИ --------------------
 
-    tzname = u.get("tz") or PROJECT_TZ
-    tz = pytz.timezone(tzname)
-    today = datetime.now(tz).date()
+ASK_NAME, ASK_BDATE, ASK_BPLACE, ASK_BTIME = range(4)
 
-    if status == "active":
-        return True, "active"
+def start(update: Update, context: CallbackContext) -> int:
+    user = update.effective_user
+    upsert_user(user.id, update.effective_chat.id)
 
-    trial_until = _parse_date(trial_until_raw)
-    if trial_until and today <= trial_until:
-        return True, "trial"
+    # deeplink
+    ref = handle_deeplink_ref(update)
+    if ref:
+        # фикс: не начисляем если реферал запускает свою же ссылку
+        accrue_ref_bonus(user.id, ref)
 
-    if bonus_days > 0:
-        return True, "bonus"
-
-    return False, "expired"
-
-
-# ---------- ПЛАНИРОВАНИЕ ----------
-def schedule_job(user_id: int, daily_time: str, tzname: Optional[str]):
-    tz = pytz.timezone(tzname or PROJECT_TZ)
-    job_id = f"user-{user_id}"
-
-    # удалить старую
-    for j in scheduler.get_jobs():
-        if j.id == job_id:
-            j.remove()
-
-    hh, mm = map(int, daily_time.split(":"))
-    scheduler.add_job(
-        send_daily_job, "cron",
-        id=job_id, replace_existing=True,
-        hour=hh, minute=mm, second=0, timezone=tz,
-        args=[user_id]
-    )
-    log.info("Scheduled %s at %02d:%02d (%s)", job_id, hh, mm, tz.zone)
-
-
-def send_daily_job(user_id: int):
-    try:
-        u = database.get_user(user_id)
-        if not u or int(u.get("is_blocked") or 0) == 1:
-            return
-
-        ok, reason = can_receive_today(u)
-        if not ok:
-            log.info("Skip user %s: reason=%s", user_id, reason)
-            return
-
-        tzname = u.get("tz") or PROJECT_TZ
-        userdata = UserData(
-            name=u.get("first_name") or "",
-            birth_date=u.get("birth_date") or "",
-            birth_place=u.get("birth_place") or "",
-            birth_time=u.get("birth_time") or "",
-            tz=tzname,
-        )
-        text = generate_daily_message(userdata)
-
-        chat_id = int(u["chat_id"])
-        updater.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-        if reason == "bonus":
-            cur = int(u.get("bonus_days") or 0)
-            if cur > 0:
-                database.update_user_field(user_id, "bonus_days", cur - 1)
-    except Exception:
-        log.exception("send_daily_job failed for %s", user_id)
-
-
-# ---------- КОМАНДЫ/ХЕНДЛЕРЫ ----------
-def start(update: Update, context: CallbackContext):
-    database.init_db()
-    m = update.effective_message
-    tgu = update.effective_user
-    chat = update.effective_chat
-
-    # создать/обновить пользователя
-    database.upsert_user(
-        tgu.id, chat.id, tgu.first_name or "", tz=PROJECT_TZ, username=tgu.username or ""
-    )
-
-    # deep-link referral: /start <code>
-    if context.args:
-        code = context.args[0]
-        credited, referrer = database.handle_referral(tgu.id, code, REFERRAL_BONUS_DAYS)
-        if credited:
-            m.reply_text("Спасибо! Бонусные дни начислены вашему пригласившему 🌟")
-        elif referrer == tgu.id:
-            m.reply_text("Это ваша собственная ссылка — бонусы себе не начисляются 🙂")
-        # если код левый — молча игнорируем
-
-    # показать меню
-    reply_menu(update, "Привет! Я готов присылать твой персональный дайджест.\nВыбери действие ниже.")
-
-    # планировать, если время уже есть
-    u = database.get_user(tgu.id)
-    if u and u.get("daily_time"):
-        schedule_job(tgu.id, u["daily_time"], u.get("tz"))
-
-
-def menu(update: Update, context: CallbackContext):
-    reply_menu(update, "Выбери действие:")
-
-
-def mytime(update: Update, context: CallbackContext):
-    u = database.get_user(update.effective_user.id)
-    tzname = u.get("tz") or PROJECT_TZ
-    tz = pytz.timezone(tzname)
-    daily = u.get("daily_time") or "не задано"
-    job_id = f"user-{u['user_id']}"
-    jobs = [j for j in scheduler.get_jobs() if j.id == job_id]
-    if jobs and jobs[0].next_run_time:
-        nxt = jobs[0].next_run_time.astimezone(tz).strftime("%d.%m %H:%M %Z")
-        update.effective_message.reply_text(f"⏰ Время: {daily} ({tzname})\n➡️ Следующий запуск: {nxt}",
-                                            reply_markup=main_menu(update.effective_user.id in ADMIN_IDS))
-    else:
-        reply_menu(update, f"⏰ Время: {daily} ({tzname}). Задача ещё не поставлена.")
-
-
-def settime(update: Update, context: CallbackContext):
-    update.effective_message.reply_text(
-        "Отправь время в формате ЧЧ:ММ (напр. 08:30).",
+    update.message.reply_text(
+        "Привет! Я твой персональный астробот.\n"
+        "Давай заполним анкету — это займёт 1–2 минуты.\n\n"
+        "Как тебя зовут?",
         reply_markup=ReplyKeyboardRemove(),
     )
-    context.user_data["await_time"] = True
+    return ASK_NAME
 
+def ask_name(update: Update, context: CallbackContext) -> int:
+    name = update.message.text.strip()
+    update_user(update.effective_user.id, name=name)
+    update.message.reply_text("Дата рождения (ДД.ММ.ГГГГ)?")
+    return ASK_BDATE
 
-def settz(update: Update, context: CallbackContext):
-    update.effective_message.reply_text(
-        "Отправь IANA-таймзону, напр.: Europe/Berlin, Asia/Yekaterinburg.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    context.user_data["await_tz"] = True
+def ask_bdate(update: Update, context: CallbackContext) -> int:
+    s = update.message.text.strip()
+    if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", s):
+        update.message.reply_text("Формат ДД.ММ.ГГГГ, попробуй ещё раз.")
+        return ASK_BDATE
+    update_user(update.effective_user.id, birth_date=s)
+    update.message.reply_text("Место рождения (город, страна)?")
+    return ASK_BPLACE
 
+def ask_bplace(update: Update, context: CallbackContext) -> int:
+    s = update.message.text.strip()
+    update_user(update.effective_user.id, birth_place=s)
+    update.message.reply_text("Время рождения (часы:минуты, например 18:25)?")
+    return ASK_BTIME
 
-def text_router(update: Update, context: CallbackContext):
-    text = (update.effective_message.text or "").strip()
+def ask_btime(update: Update, context: CallbackContext) -> int:
+    s = update.message.text.strip()
+    if not re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", s):
+        update.message.reply_text("Формат ЧЧ:ММ, попробуй ещё раз.")
+        return ASK_BTIME
+    update_user(update.effective_user.id, birth_time=s)
+    send_main_menu(update, context, "Готово! Анкета сохранена.\n")
+    return ConversationHandler.END
+
+def menu(update: Update, context: CallbackContext) -> None:
+    send_main_menu(update, context)
+
+def handle_menu_buttons(update: Update, context: CallbackContext) -> None:
+    t = (update.message.text or "").strip()
     uid = update.effective_user.id
 
-    # ожидание времени
-    if context.user_data.pop("await_time", False):
-        if not TIME_RE.match(text):
-            reply_menu(update, "Формат времени: ЧЧ:ММ, напр. 09:15.")
-            return
-        database.update_user_field(uid, "daily_time", text)
-        u = database.get_user(uid)
-        schedule_job(uid, text, u.get("tz"))
-        reply_menu(update, "Сохранено ✅")
+    if t == "🕒 Изменить время":
+        update.message.reply_text("Укажи местное время для ежедневного сообщения (ЧЧ:ММ):",
+                                  reply_markup=ReplyKeyboardRemove())
+        context.user_data["waiting"] = "send_time"
         return
 
-    # ожидание TZ
-    if context.user_data.pop("await_tz", False):
+    if t == "🗺 Часовой пояс":
+        update.message.reply_text("Введи название часового пояса (например, Asia/Yekaterinburg):",
+                                  reply_markup=ReplyKeyboardRemove())
+        context.user_data["waiting"] = "tz"
+        return
+
+    if t == "📝 Обновить анкету":
+        return start(update, context)
+
+    if t == "📣 Рефералы":
+        me = get_user(uid)
+        link = f"https://t.me/{context.bot.username}?start={uid}"
+        invited = []  # можно хранить отдельно; тут просто ссылка и баланс
+        reply = (
+            f"Твоя реферальная ссылка:\n{link}\n\n"
+            f"Бонусные дни: {int(me.get('bonus_days') or 0)}\n"
+            f"Поделись ссылкой — и получай бонусные дни."
+        )
+        update.message.reply_text(reply)
+        return send_main_menu(update, context)
+
+    if t == "🔔 Статус":
+        me = get_user(uid)
+        is_sub = "да" if int(me.get("is_subscribed") or 0) else "нет"
+        sub_until = me.get("sub_until") or "—"
+        bonus = int(me.get("bonus_days") or 0)
+        trial_info = ""
+        cr = _parse_iso(me.get("created_at") or "")
+        if cr:
+            days = (datetime.now(timezone.utc) - cr).days
+            if days < 10:
+                trial_info = f"\nПробный период: осталось {max(0, 9 - days)} дн."
+        update.message.reply_text(
+            f"Подписка: {is_sub}\nДействует до: {sub_until}\nБонусные дни: {bonus}{trial_info}"
+        )
+        return send_main_menu(update, context)
+
+    if t == "❌ Отмена":
+        return send_main_menu(update, context, "Меню закрыто.")
+
+    if t == "👑 Админка" and uid in ADMIN_IDS:
+        kb = [
+            ["📤 Broadcast", "🔧 Начислить бонус"],
+            ["🚫 Блок", "✅ Разблок"],
+            ["ℹ️ Пользователь", "⬅️ Назад"],
+        ]
+        update.message.reply_text("Админ-меню:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+        context.user_data["admin"] = True
+        return
+
+    # обработка admin-меню
+    if context.user_data.get("admin"):
+        if t == "⬅️ Назад":
+            context.user_data["admin"] = False
+            return send_main_menu(update, context)
+
+        if t == "📤 Broadcast":
+            update.message.reply_text("Отправь текст рассылки:",
+                                      reply_markup=ReplyKeyboardRemove())
+            context.user_data["admin_wait"] = "broadcast"
+            return
+        if t == "🔧 Начислить бонус":
+            update.message.reply_text("Формат: user_id пробел дни. Пример: 123456 5",
+                                      reply_markup=ReplyKeyboardRemove())
+            context.user_data["admin_wait"] = "bonus"
+            return
+        if t == "🚫 Блок":
+            update.message.reply_text("Укажи user_id для блокировки:",
+                                      reply_markup=ReplyKeyboardRemove())
+            context.user_data["admin_wait"] = "block"
+            return
+        if t == "✅ Разблок":
+            update.message.reply_text("Укажи user_id для разблокировки:",
+                                      reply_markup=ReplyKeyboardRemove())
+            context.user_data["admin_wait"] = "unblock"
+            return
+        if t == "ℹ️ Пользователь":
+            update.message.reply_text("Укажи user_id:",
+                                      reply_markup=ReplyKeyboardRemove())
+            context.user_data["admin_wait"] = "info"
+            return
+
+    # если ждём конкретный ввод
+    waiting = context.user_data.pop("waiting", None)
+    if waiting == "send_time":
+        tm = parse_time_hhmm(t)
+        if not tm:
+            update.message.reply_text("Формат ЧЧ:ММ. Попробуй ещё раз.")
+            context.user_data["waiting"] = "send_time"
+            return
+        update_user(uid, send_time=f"{tm.hour:02d}:{tm.minute:02d}")
+        schedule_user_job(context, get_user(uid))
+        send_main_menu(update, context, f"Сохранил время {tm.hour:02d}:{tm.minute:02d}.")
+        return
+
+    if waiting == "tz":
         try:
-            pytz.timezone(text)  # проверка
+            _ = pytz.timezone(t)
         except Exception:
-            reply_menu(update, "Некорректная таймзона. Пример: Asia/Yekaterinburg")
+            update.message.reply_text("Неверный TZ. Примеры: Europe/Berlin, Asia/Yekaterinburg")
+            context.user_data["waiting"] = "tz"
             return
-        database.update_user_field(uid, "tz", text)
-        u = database.get_user(uid)
-        if u.get("daily_time"):
-            schedule_job(uid, u["daily_time"], text)
-        reply_menu(update, "Часовой пояс обновлён ✅")
+        update_user(uid, tz=t)
+        schedule_user_job(context, get_user(uid))
+        send_main_menu(update, context, f"Часовой пояс сохранён: {t}")
         return
 
-    # меню обновления профиля
-    if text == "🧾 Обновить данные":
-        update.effective_message.reply_text("Что вы хотите изменить?", reply_markup=UPDATE_MENU)
-        context.user_data["await_update"] = True
-        return
+    # ожидание админских вводов
+    aw = context.user_data.pop("admin_wait", None)
+    if aw and uid in ADMIN_IDS:
+        if aw == "broadcast":
+            text = update.message.text
+            cnt = 0
+            for u in all_users():
+                try:
+                    if u.get("chat_id") and not u.get("is_blocked"):
+                        context.bot.send_message(chat_id=u["chat_id"], text=text)
+                        cnt += 1
+                except Exception:
+                    pass
+            update.message.reply_text(f"Отправлено {cnt} пользователям.")
+            return send_main_menu(update, context)
+        if aw == "bonus":
+            m = re.match(r"^\s*(\d+)\s+(\-?\d+)\s*$", update.message.text or "")
+            if not m:
+                update.message.reply_text("Нужно: user_id и дни (число).")
+                context.user_data["admin_wait"] = "bonus"
+                return
+            uid2 = int(m.group(1))
+            days = int(m.group(2))
+            u2 = get_user(uid2)
+            if not u2:
+                update.message.reply_text("Нет такого пользователя.")
+                return send_main_menu(update, context)
+            new_b = int(u2.get("bonus_days") or 0) + days
+            update_user(uid2, bonus_days=max(0, new_b))
+            update.message.reply_text("Готово.")
+            return send_main_menu(update, context)
+        if aw == "block":
+            uid2 = int(update.message.text.strip())
+            update_user(uid2, is_blocked=1)
+            update.message.reply_text("Заблокирован.")
+            return send_main_menu(update, context)
+        if aw == "unblock":
+            uid2 = int(update.message.text.strip())
+            update_user(uid2, is_blocked=0)
+            update.message.reply_text("Разблокирован.")
+            return send_main_menu(update, context)
+        if aw == "info":
+            uid2 = int(update.message.text.strip())
+            u2 = get_user(uid2)
+            if not u2:
+                update.message.reply_text("Нет такого пользователя.")
+            else:
+                update.message.reply_text("```\n" + json.dumps(u2, ensure_ascii=False, indent=2) + "\n```",
+                                          parse_mode=ParseMode.MARKDOWN)
+            return send_main_menu(update, context)
 
-    if context.user_data.get("await_update"):
-        if text == "⬅️ Оставить как есть":
-            context.user_data["await_update"] = False
-            reply_menu(update, "Меню открыто.")
-            return
-        elif text == "Имя":
-            update.effective_message.reply_text("Отправьте новое имя.", reply_markup=ReplyKeyboardRemove())
-            context.user_data["await_name"] = True
-            return
-        elif text == "Дата рождения":
-            update.effective_message.reply_text("ДД.ММ.ГГГГ", reply_markup=ReplyKeyboardRemove())
-            context.user_data["await_birth_date"] = True
-            return
-        elif text == "Место рождения":
-            update.effective_message.reply_text("Город, страна", reply_markup=ReplyKeyboardRemove())
-            context.user_data["await_birth_place"] = True
-            return
-        elif text == "Время рождения":
-            update.effective_message.reply_text("ЧЧ:ММ", reply_markup=ReplyKeyboardRemove())
-            context.user_data["await_birth_time"] = True
-            return
+# -------------------- КОМАНДЫ --------------------
 
-    # поля
-    if context.user_data.pop("await_name", False):
-        database.update_user_field(uid, "first_name", text)
-        reply_menu(update, "Имя обновлено ✅")
-        return
-    if context.user_data.pop("await_birth_date", False):
-        database.update_user_field(uid, "birth_date", text)
-        reply_menu(update, "Дата рождения обновлена ✅")
-        return
-    if context.user_data.pop("await_birth_place", False):
-        database.update_user_field(uid, "birth_place", text)
-        reply_menu(update, "Место рождения обновлено ✅")
-        return
-    if context.user_data.pop("await_birth_time", False):
-        if not TIME_RE.match(text):
-            reply_menu(update, "Формат ЧЧ:ММ, напр. 07:30.")
-            return
-        database.update_user_field(uid, "birth_time", text)
-        reply_menu(update, "Время рождения обновлено ✅")
-        return
+def cmd_menu(update: Update, context: CallbackContext):
+    return send_main_menu(update, context)
 
-    # кнопки главного меню
-    if text == "🕒 Изменить время":
-        return settime(update, context)
-    if text == "🌍 Часовой пояс":
-        return settz(update, context)
-    if text == "ℹ️ Мой статус":
-        u = database.get_user(uid)
-        ok, reason = can_receive_today(u)
-        reply_menu(update, f"Статус: {reason} (ok={ok})")
-        return
-    if text == "⏰ Мой запуск (/mytime)":
-        return mytime(update, context)
+def cmd_stop(update: Update, context: CallbackContext):
+    update.message.reply_text("Диалог завершён.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
 
-    # админка
-    if text == "⚙️ Админка" and uid in ADMIN_IDS:
-        update.effective_message.reply_text("Админ-меню:", reply_markup=ADMIN_MENU)
-        return
+# -------------------- MAIN --------------------
 
-    if uid in ADMIN_IDS:
-        if text == "⬅️ В меню":
-            reply_menu(update, "Ок")
-            return
-        if text == "📣 Рассылка":
-            update.effective_message.reply_text("Пришли текст рассылки. Он уйдёт всем (не заблокированным).",
-                                                reply_markup=ReplyKeyboardRemove())
-            context.user_data["await_broadcast"] = True
-            return
-        if text == "➕ Бонусы":
-            update.effective_message.reply_text("Формат: <telegram_id> <дней> (например: 123456789 5)",
-                                                reply_markup=ReplyKeyboardRemove())
-            context.user_data["await_bonus"] = True
-            return
-        if text == "🚫 Блокировка":
-            update.effective_message.reply_text("Команды: /ban <id> или /unban <id>", reply_markup=ADMIN_MENU)
-            return
-        if text == "👀 Статистика":
-            s = database.stats()
-            update.effective_message.reply_text(
-                f"Всего: {s['total']}\nАктивных: {s['active']}\nОплативших: {s['paid']}\nРефералов: {s['refs']}",
-                reply_markup=ADMIN_MENU,
-            )
-            return
+def main() -> None:
+    init_db()
 
-    if context.user_data.pop("await_broadcast", False) and uid in ADMIN_IDS:
-        count = 0
-        for chat_id in database.all_active_chats():
-            try:
-                updater.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-                count += 1
-            except Exception:
-                continue
-        reply_menu(update, f"✅ Отправлено: {count}")
-        return
-
-    if context.user_data.pop("await_bonus", False) and uid in ADMIN_IDS:
-        try:
-            tg_id_s, days_s = text.split()
-            database.add_bonus_days(int(tg_id_s), int(days_s))
-            reply_menu(update, "Готово ✅")
-        except Exception:
-            reply_menu(update, "Неверный формат. Пример: 123456789 5")
-        return
-
-    # про бан/разбан
-    if uid in ADMIN_IDS and text.startswith("/ban"):
-        try:
-            ban_id = int(text.split()[1])
-            database.set_block(ban_id, True)
-            reply_menu(update, f"Пользователь {ban_id} заблокирован ✅")
-        except Exception:
-            reply_menu(update, "Формат: /ban 123456")
-        return
-    if uid in ADMIN_IDS and text.startswith("/unban"):
-        try:
-            ban_id = int(text.split()[1])
-            database.set_block(ban_id, False)
-            reply_menu(update, f"Пользователь {ban_id} разблокирован ✅")
-        except Exception:
-            reply_menu(update, "Формат: /unban 123456")
-        return
-
-    # по умолчанию
-    reply_menu(update, "Выбери действие:")
-
-
-def error_handler(update: object, context: CallbackContext) -> None:
-    log.exception("Unhandled error", exc_info=context.error)
-
-
-def main():
-    database.init_db()
-
-    global updater
     updater = Updater(BOT_TOKEN, use_context=True)
-
     dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", start, pass_args=True))
-    dp.add_handler(CommandHandler("menu", menu))
-    dp.add_handler(CommandHandler("settime", settime))
-    dp.add_handler(CommandHandler("settz", settz))
-    dp.add_handler(CommandHandler("mytime", mytime))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, text_router))
-    dp.add_error_handler(error_handler)
 
-    if not scheduler.running:
-        scheduler.start()
+    # Диалог анкеты
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            ASK_NAME:   [MessageHandler(Filters.text & ~Filters.command, ask_name)],
+            ASK_BDATE:  [MessageHandler(Filters.text & ~Filters.command, ask_bdate)],
+            ASK_BPLACE: [MessageHandler(Filters.text & ~Filters.command, ask_bplace)],
+            ASK_BTIME:  [MessageHandler(Filters.text & ~Filters.command, ask_btime)],
+        },
+        fallbacks=[CommandHandler("stop", cmd_stop)],
+        allow_reentry=True,
+    )
+    dp.add_handler(conv)
 
-    # webhook на Render (порт 10000 внутри контейнера)
-    updater.start_webhook(listen="0.0.0.0", port=PORT, url_path=WEBHOOK_SECRET)
-    if PUBLIC_URL:
-        updater.bot.set_webhook(f"{PUBLIC_URL}/{WEBHOOK_SECRET}")
-        log.info("Webhook started: %s/%s", PUBLIC_URL, WEBHOOK_SECRET)
-    else:
-        log.warning("PUBLIC_URL is empty, falling back to polling")
+    # Меню
+    dp.add_handler(CommandHandler("menu", cmd_menu))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_menu_buttons))
+
+    # Пересоздаём джобы при старте
+    updater.job_queue.run_once(lambda c: reschedule_all(c), 1)
+
+    # ---------- Старт через webhook c авто-фолбэком на polling ----------
+    webhook_url = f"{PUBLIC_URL}/{WEBHOOK_SECRET}" if (USE_WEBHOOK and PUBLIC_URL and WEBHOOK_SECRET) else None
+    try:
+        if webhook_url:
+            updater.start_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=WEBHOOK_SECRET,
+                webhook_url=webhook_url,
+            )
+            log.info("Webhook started at %s", webhook_url)
+        else:
+            updater.start_polling()
+            log.info("Polling started")
+    except Exception:
+        log.exception("Webhook failed, fallback to polling()")
         updater.start_polling()
 
-    log.info("Service is live")
     updater.idle()
 
 
