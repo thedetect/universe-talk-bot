@@ -1,126 +1,139 @@
+# -*- coding: utf-8 -*-
+"""
+SQLite-слой с автомиграцией схемы для Telegram-бота.
+- Создаёт таблицу users, если её нет.
+- Добавляет недостающие колонки (без потери данных).
+- Совместим со старыми БД, где была колонка telegram_id вместо user_id.
+"""
 
-from __future__ import annotations
-import sqlite3, threading
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
-from . import config
+import os
+import sqlite3
+from contextlib import closing
 
-_DB_LOCK = threading.Lock()
+# Путь к БД: через переменную окружения DB_PATH, иначе рядом с проектом.
+DB_PATH = os.getenv(
+    "DB_PATH",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "user_data.db")),
+)
 
-SCHEMA = '''
-CREATE TABLE IF NOT EXISTS users (
-    telegram_id INTEGER PRIMARY KEY,
-    name TEXT,
-    birth_date TEXT,
-    birth_place TEXT,
-    birth_time TEXT,
-    notify_time TEXT,
-    created_at TEXT,
-    referral_code TEXT,
-    referred_by INTEGER,
-    points INTEGER DEFAULT 0,
-    is_trial INTEGER DEFAULT 1,
-    trial_expiration TEXT,
-    subscription_until TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_referred_by ON users(referred_by);
-'''
+# Описание актуальной схемы (колонки -> тип)
+SCHEMA_COLUMNS = {
+    "user_id": "INTEGER",                     # уникальный ID пользователя Telegram
+    "chat_id": "INTEGER",                     # текущий chat_id
+    "name": "TEXT",
+    "birth_date": "TEXT",                     # ДД.ММ.ГГГГ
+    "birth_place": "TEXT",                    # "город, страна"
+    "birth_time": "TEXT",                     # "HH:MM"
+    "daily_time": "TEXT",                     # время рассылки "HH:MM"
+    "tz": "TEXT",                             # таймзона пользователя
+    "referral_code": "TEXT",
+    "referred_by": "TEXT",
+    "bonus_days": "INTEGER",
+    "trial_start": "TEXT",                    # ISO-строка даты
+    "trial_until": "TEXT",                    # ISO-строка даты
+    "subscription_status": "TEXT",            # 'trial' | 'active' | 'expired'
+}
 
-def _conn():
-    return sqlite3.connect(config.DB_PATH, check_same_thread=False)
+DEFAULTS = {
+    "bonus_days": 0,
+    "tz": "Europe/Berlin",
+    "subscription_status": "trial",
+}
+
+def _connect():
+    # check_same_thread=False — чтобы можно было использовать в APScheduler
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
-    with _DB_LOCK:
-        with _conn() as con:
-            con.executescript(SCHEMA)
+    """Создаёт таблицу users (если нет) и выполняет автомиграции."""
+    with closing(_connect()) as con, closing(con.cursor()) as cur:
+        # Базовая таблица (минимальный набор, остальное добавим АЛЬТЕРАМИ)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER UNIQUE,
+                chat_id INTEGER,
+                name TEXT,
+                birth_date TEXT,
+                birth_place TEXT,
+                birth_time TEXT,
+                daily_time TEXT,
+                tz TEXT,
+                referral_code TEXT,
+                referred_by TEXT,
+                bonus_days INTEGER DEFAULT 0,
+                trial_start TEXT,
+                trial_until TEXT,
+                subscription_status TEXT DEFAULT 'trial'
+            );
+        """)
+        # Текущие колонки в таблице
+        cur.execute("PRAGMA table_info(users)")
+        existing = {row[1] for row in cur.fetchall()}
 
-def upsert_user(telegram_id: int, **fields):
-    fields = dict(fields)
-    with _DB_LOCK, _conn() as con:
-        cur = con.cursor()
-        placeholders = ", ".join([f"{k}=?" for k in fields.keys()])
-        values = list(fields.values()) + [telegram_id]
-        cur.execute(f"UPDATE users SET {placeholders} WHERE telegram_id = ?", values)
+        # Миграция: если была старая колонка telegram_id — переносим в user_id
+        if "telegram_id" in existing and "user_id" not in existing:
+            cur.execute("ALTER TABLE users ADD COLUMN user_id INTEGER;")
+            cur.execute("UPDATE users SET user_id = telegram_id WHERE user_id IS NULL;")
+            existing.add("user_id")
+
+        # Добавляем недостающие колонки из актуальной схемы
+        for col, typ in SCHEMA_COLUMNS.items():
+            if col not in existing:
+                if col in DEFAULTS:
+                    default_val = DEFAULTS[col]
+                    if isinstance(default_val, int):
+                        cur.execute(f"ALTER TABLE users ADD COLUMN {col} {typ} DEFAULT {default_val};")
+                    else:
+                        cur.execute(f"ALTER TABLE users ADD COLUMN {col} {typ} DEFAULT '{default_val}';")
+                else:
+                    cur.execute(f"ALTER TABLE users ADD COLUMN {col} {typ};")
+
+        # Индексы
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_chat_id ON users(chat_id);")
+
+        con.commit()
+
+def upsert_user(user_id: int, chat_id: int):
+    """Создаёт пользователя или обновляет chat_id по user_id."""
+    with closing(_connect()) as con, closing(con.cursor()) as cur:
+        cur.execute("""
+            INSERT INTO users (user_id, chat_id)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id;
+        """, (user_id, chat_id))
+        con.commit()
+
+def update_user_field(user_id: int, field: str, value):
+    """Обновляет одно поле пользователя. Бросит ValueError для неизвестных полей."""
+    if field not in SCHEMA_COLUMNS:
+        raise ValueError(f"unknown field: {field}")
+
+    with closing(_connect()) as con, closing(con.cursor()) as cur:
+        cur.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (value, user_id))
+        # Если строки нет — создадим и сразу поставим поле
         if cur.rowcount == 0:
-            cols = ["telegram_id"] + list(fields.keys())
-            vals = [telegram_id] + list(fields.values())
-            q = f"INSERT INTO users ({', '.join(cols)}) VALUES ({', '.join(['?']*len(vals))})"
-            cur.execute(q, vals)
+            # создаём пользователя и снова обновляем
+            cur.execute("""
+                INSERT INTO users (user_id, chat_id)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO NOTHING;
+            """, (user_id, None))
+            cur.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (value, user_id))
         con.commit()
 
-def get_user(telegram_id: int) -> Optional[Dict[str, Any]]:
-    with _DB_LOCK, _conn() as con:
-        con.row_factory = sqlite3.Row
-        r = con.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
-        return dict(r) if r else None
+def get_user(user_id: int) -> dict | None:
+    """Возвращает словарь с данными пользователя или None."""
+    with closing(_connect()) as con, closing(con.cursor()) as cur:
+        cur.execute(f"SELECT {', '.join(SCHEMA_COLUMNS.keys())} FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip(SCHEMA_COLUMNS.keys(), row))
 
-def get_all_users() -> List[Dict[str, Any]]:
-    with _DB_LOCK, _conn() as con:
-        con.row_factory = sqlite3.Row
-        return [dict(r) for r in con.execute("SELECT * FROM users").fetchall()]
-
-def update_user_field(telegram_id: int, field: str, value):
-    with _DB_LOCK, _conn() as con:
-        con.execute(f"UPDATE users SET {field}=? WHERE telegram_id=?", (value, telegram_id))
-        con.commit()
-
-def list_referrals(telegram_id: int) -> List[Dict[str, Any]]:
-    with _DB_LOCK, _conn() as con:
-        con.row_factory = sqlite3.Row
-        return [dict(r) for r in con.execute("SELECT * FROM users WHERE referred_by=?", (telegram_id,)).fetchall()]
-
-def add_referral_points(telegram_id: int, days: int):
-    u = get_user(telegram_id) or {}
-    pts = int(u.get("points") or 0) + int(days)
-    update_user_field(telegram_id, "points", pts)
-
-def award_trial_if_needed(telegram_id: int):
-    u = get_user(telegram_id)
-    if not u:
-        return
-    if u.get("trial_expiration"):
-        return
-    until = (datetime.utcnow() + timedelta(days=config.TRIAL_DAYS)).strftime("%Y-%m-%d")
-    upsert_user(telegram_id, is_trial=1, trial_expiration=until)
-
-def use_bonus_days_if_needed(telegram_id: int):
-    u = get_user(telegram_id) or {}
-    today = datetime.utcnow().date()
-    trial_exp = u.get("trial_expiration")
-    sub_until = u.get("subscription_until")
-    points = int(u.get("points") or 0)
-    if sub_until:
-        return
-    if trial_exp and datetime.strptime(trial_exp, "%Y-%m-%d").date() >= today:
-        return
-    if points > 0:
-        new_until = today + timedelta(days=points)
-        upsert_user(telegram_id, subscription_until=new_until.strftime("%Y-%m-%d"), points=0, is_trial=0)
-
-def has_access(telegram_id: int) -> bool:
-    u = get_user(telegram_id) or {}
-    today = datetime.utcnow().date()
-    if u.get("subscription_until"):
-        try:
-            if datetime.strptime(u["subscription_until"], "%Y-%m-%d").date() >= today:
-                return True
-        except: pass
-    if u.get("trial_expiration"):
-        try:
-            if datetime.strptime(u["trial_expiration"], "%Y-%m-%d").date() >= today:
-                return True
-        except: pass
-    return False
-
-def extend_subscription(telegram_id: int, days: int):
-    u = get_user(telegram_id) or {}
-    today = datetime.utcnow().date()
-    base = today
-    if u.get("subscription_until"):
-        try:
-            cur = datetime.strptime(u["subscription_until"], "%Y-%m-%d").date()
-            if cur > base:
-                base = cur
-        except: pass
-    new_until = base + timedelta(days=days)
-    upsert_user(telegram_id, subscription_until=new_until.strftime("%Y-%m-%d"), is_trial=0)
+def get_all_users():
+    """Все пользователи (список словарей)."""
+    with closing(_connect()) as con, closing(con.cursor()) as cur:
+        cur.execute(f"SELECT {', '.join(SCHEMA_COLUMNS.keys())} FROM users")
+        rows = cur.fetchall()
+        return [dict(zip(SCHEMA_COLUMNS.keys(), r)) for r in rows]
